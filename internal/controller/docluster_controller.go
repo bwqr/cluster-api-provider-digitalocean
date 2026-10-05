@@ -136,38 +136,49 @@ func (r *DOClusterReconciler) reconcile(ctx context.Context, clusterScope *scope
 	apiServerLoadbalancer := clusterScope.APIServerLoadbalancers()
 	apiServerLoadbalancer.ApplyDefault()
 
-	apiServerLoadbalancerRef := clusterScope.APIServerLoadbalancersRef()
-	lbUUID := apiServerLoadbalancerRef.ResourceID
+	controlPlaneEndpointIP := ""
 
-	if apiServerLoadbalancer.ResourceID != "" {
-		lbUUID = apiServerLoadbalancer.ResourceID
-	}
+	if apiServerLoadbalancer.IP != "" {
+		clusterScope.Info("Using IP of custom load balancer as Control Plane IP")
 
-	loadbalancer, err := networkingsvc.GetLoadBalancer(lbUUID)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	if loadbalancer == nil {
-		loadbalancer, err = networkingsvc.CreateLoadBalancer(apiServerLoadbalancer)
-		if err != nil {
-			return reconcile.Result{}, errors.Wrapf(err, "failed to create load balancers for DOCluster %s/%s", docluster.Namespace, docluster.Name)
+		controlPlaneEndpointIP = apiServerLoadbalancer.IP
+	} else {
+		apiServerLoadbalancerRef := clusterScope.APIServerLoadbalancersRef()
+		lbUUID := apiServerLoadbalancerRef.ResourceID
+
+		if apiServerLoadbalancer.ResourceID != "" {
+			lbUUID = apiServerLoadbalancer.ResourceID
 		}
 
-		r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "LoadBalancerCreated", "Created new load balancers - %s", loadbalancer.Name)
+		loadbalancer, err := networkingsvc.GetLoadBalancer(lbUUID)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if loadbalancer == nil {
+			loadbalancer, err = networkingsvc.CreateLoadBalancer(apiServerLoadbalancer)
+			if err != nil {
+				return reconcile.Result{}, errors.Wrapf(err, "failed to create load balancers for DOCluster %s/%s", docluster.Namespace, docluster.Name)
+			}
+
+			r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "LoadBalancerCreated", "Created new load balancers - %s", loadbalancer.Name)
+		}
+
+		apiServerLoadbalancerRef.ResourceID = loadbalancer.ID
+		apiServerLoadbalancerRef.ResourceStatus = infrav1.DOResourceStatus(loadbalancer.Status)
+		apiServerLoadbalancer.ResourceID = loadbalancer.ID
+
+		if apiServerLoadbalancerRef.ResourceStatus != infrav1.DOResourceStatusRunning && loadbalancer.IP == "" {
+			clusterScope.Info("Waiting on API server Global IP Address")
+			return reconcile.Result{RequeueAfter: 15 * time.Second}, nil
+		}
+
+		r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "LoadBalancerReady", "LoadBalancer got an IP Address - %s", loadbalancer.IP)
+	
+		controlPlaneEndpointIP = loadbalancer.IP
 	}
 
-	apiServerLoadbalancerRef.ResourceID = loadbalancer.ID
-	apiServerLoadbalancerRef.ResourceStatus = infrav1.DOResourceStatus(loadbalancer.Status)
-	apiServerLoadbalancer.ResourceID = loadbalancer.ID
+	var controlPlaneEndpoint = controlPlaneEndpointIP
 
-	if apiServerLoadbalancerRef.ResourceStatus != infrav1.DOResourceStatusRunning && loadbalancer.IP == "" {
-		clusterScope.Info("Waiting on API server Global IP Address")
-		return reconcile.Result{RequeueAfter: 15 * time.Second}, nil
-	}
-
-	r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "LoadBalancerReady", "LoadBalancer got an IP Address - %s", loadbalancer.IP)
-
-	var controlPlaneEndpoint = loadbalancer.IP
 	if docluster.Spec.ControlPlaneDNS != nil {
 		clusterScope.Info("Verifying LB DNS Record")
 		// ensure DNS record is created and use it as control plane endpoint
@@ -184,14 +195,14 @@ func (r *DOClusterReconciler) reconcile(ctx context.Context, clusterScope *scope
 				recordSpec.Name, recordSpec.Domain)
 		}
 
-		if dRecord == nil || dRecord.Data != loadbalancer.IP {
+		if dRecord == nil || dRecord.Data != controlPlaneEndpointIP {
 			clusterScope.Info("Ensuring LB DNS Record is in place")
 			clusterScope.SetControlPlaneDNSRecordReady(false)
 			if err := networkingsvc.UpsertDomainRecord(
 				recordSpec.Domain,
 				recordSpec.Name,
 				"A",
-				loadbalancer.IP,
+				controlPlaneEndpointIP,
 			); err != nil {
 				return reconcile.Result{}, errors.Wrap(err, "failed to reconcile LB DNS record")
 			}
@@ -206,7 +217,7 @@ func (r *DOClusterReconciler) reconcile(ctx context.Context, clusterScope *scope
 		// propagation check works around the DNS cache problem by directly
 		// making DNS queries and not going through system resolvers.
 		if !clusterScope.DOCluster.Status.ControlPlaneDNSRecordReady {
-			propagated, err := dnsutil.CheckDNSPropagated(dnsutil.ToFQDN(recordSpec.Name, recordSpec.Domain), loadbalancer.IP)
+			propagated, err := dnsutil.CheckDNSPropagated(dnsutil.ToFQDN(recordSpec.Name, recordSpec.Domain), controlPlaneEndpointIP)
 			if err != nil {
 				return reconcile.Result{}, errors.Wrap(err, "failed to check DNS propagation")
 			}
@@ -221,7 +232,7 @@ func (r *DOClusterReconciler) reconcile(ctx context.Context, clusterScope *scope
 		}
 
 		clusterScope.Info("LB DNS Record is already ready")
-		r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "DomainRecordReady", "DNS Record '%s.%s' with IP '%s'", recordSpec.Name, recordSpec.Domain, loadbalancer.IP)
+		r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "DomainRecordReady", "DNS Record '%s.%s' with IP '%s'", recordSpec.Name, recordSpec.Domain, controlPlaneEndpointIP)
 	}
 
 	clusterScope.SetControlPlaneEndpoint(clusterv1beta1.APIEndpoint{
