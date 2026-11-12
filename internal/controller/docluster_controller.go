@@ -136,13 +136,9 @@ func (r *DOClusterReconciler) reconcile(ctx context.Context, clusterScope *scope
 	apiServerLoadbalancer := clusterScope.APIServerLoadbalancers()
 	apiServerLoadbalancer.ApplyDefault()
 
-	controlPlaneEndpointIP := ""
+	loadbalancerIP := apiServerLoadbalancer.IP
 
-	if apiServerLoadbalancer.IP != "" {
-		clusterScope.Info("Using IP of custom load balancer as Control Plane IP")
-
-		controlPlaneEndpointIP = apiServerLoadbalancer.IP
-	} else {
+	if loadbalancerIP == "" {
 		apiServerLoadbalancerRef := clusterScope.APIServerLoadbalancersRef()
 		lbUUID := apiServerLoadbalancerRef.ResourceID
 
@@ -174,65 +170,69 @@ func (r *DOClusterReconciler) reconcile(ctx context.Context, clusterScope *scope
 
 		r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "LoadBalancerReady", "LoadBalancer got an IP Address - %s", loadbalancer.IP)
 	
-		controlPlaneEndpointIP = loadbalancer.IP
+		loadbalancerIP = loadbalancer.IP
 	}
 
-	var controlPlaneEndpoint = controlPlaneEndpointIP
+	var controlPlaneEndpoint = loadbalancerIP
 
 	if docluster.Spec.ControlPlaneDNS != nil {
-		clusterScope.Info("Verifying LB DNS Record")
-		// ensure DNS record is created and use it as control plane endpoint
-		recordSpec := docluster.Spec.ControlPlaneDNS
-		controlPlaneEndpoint = fmt.Sprintf("%s.%s", recordSpec.Name, recordSpec.Domain)
-		dRecord, err := networkingsvc.GetDomainRecord(
-			recordSpec.Domain,
-			recordSpec.Name,
-			"A",
-		)
+		controlPlaneEndpoint = fmt.Sprintf("%s.%s", docluster.Spec.ControlPlaneDNS.Name, docluster.Spec.ControlPlaneDNS.Domain)
 
-		if err != nil {
-			return reconcile.Result{}, errors.Wrapf(err, "failed verify DNS record for LB Name %s.%s",
-				recordSpec.Name, recordSpec.Domain)
-		}
-
-		if dRecord == nil || dRecord.Data != controlPlaneEndpointIP {
-			clusterScope.Info("Ensuring LB DNS Record is in place")
-			clusterScope.SetControlPlaneDNSRecordReady(false)
-			if err := networkingsvc.UpsertDomainRecord(
+		if apiServerLoadbalancer.IP != "" {
+			clusterScope.Info("Verifying LB DNS Record")
+			// ensure DNS record is created and use it as control plane endpoint
+			recordSpec := docluster.Spec.ControlPlaneDNS
+			controlPlaneEndpoint = fmt.Sprintf("%s.%s", recordSpec.Name, recordSpec.Domain)
+			dRecord, err := networkingsvc.GetDomainRecord(
 				recordSpec.Domain,
 				recordSpec.Name,
 				"A",
-				controlPlaneEndpointIP,
-			); err != nil {
-				return reconcile.Result{}, errors.Wrap(err, "failed to reconcile LB DNS record")
-			}
-		}
+			)
 
-		// If the record has never been ready we need to check whether it has
-		// been propagated or not. Updating the record in the DNS API does not
-		// mean it is already advertised at the DNS server. If the DNS is slower
-		// than our reconciliation is, we'd fall into a case where our
-		// reconciler hits an NXDOMAIN which is then stored in the negative
-		// cache, so all our retries would fail until the cache TTL is up. This
-		// propagation check works around the DNS cache problem by directly
-		// making DNS queries and not going through system resolvers.
-		if !clusterScope.DOCluster.Status.ControlPlaneDNSRecordReady {
-			propagated, err := dnsutil.CheckDNSPropagated(dnsutil.ToFQDN(recordSpec.Name, recordSpec.Domain), controlPlaneEndpointIP)
 			if err != nil {
-				return reconcile.Result{}, errors.Wrap(err, "failed to check DNS propagation")
+				return reconcile.Result{}, errors.Wrapf(err, "failed verify DNS record for LB Name %s.%s",
+					recordSpec.Name, recordSpec.Domain)
 			}
 
-			if !propagated {
-				clusterScope.Info("Waiting for DNS record to be propagated")
-				return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+			if dRecord == nil || dRecord.Data != loadbalancerIP {
+				clusterScope.Info("Ensuring LB DNS Record is in place")
+				clusterScope.SetControlPlaneDNSRecordReady(false)
+				if err := networkingsvc.UpsertDomainRecord(
+					recordSpec.Domain,
+					recordSpec.Name,
+					"A",
+					loadbalancerIP,
+				); err != nil {
+					return reconcile.Result{}, errors.Wrap(err, "failed to reconcile LB DNS record")
+				}
 			}
 
-			clusterScope.Info("DNS record is propagated - set DOCluster ControlPlaneDNSRecordReady status to ready")
-			clusterScope.SetControlPlaneDNSRecordReady(true)
+			// If the record has never been ready we need to check whether it has
+			// been propagated or not. Updating the record in the DNS API does not
+			// mean it is already advertised at the DNS server. If the DNS is slower
+			// than our reconciliation is, we'd fall into a case where our
+			// reconciler hits an NXDOMAIN which is then stored in the negative
+			// cache, so all our retries would fail until the cache TTL is up. This
+			// propagation check works around the DNS cache problem by directly
+			// making DNS queries and not going through system resolvers.
+			if !clusterScope.DOCluster.Status.ControlPlaneDNSRecordReady {
+				propagated, err := dnsutil.CheckDNSPropagated(dnsutil.ToFQDN(recordSpec.Name, recordSpec.Domain), loadbalancerIP)
+				if err != nil {
+					return reconcile.Result{}, errors.Wrap(err, "failed to check DNS propagation")
+				}
+
+				if !propagated {
+					clusterScope.Info("Waiting for DNS record to be propagated")
+					return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+				}
+
+				clusterScope.Info("DNS record is propagated - set DOCluster ControlPlaneDNSRecordReady status to ready")
+				clusterScope.SetControlPlaneDNSRecordReady(true)
+			}
+
+			clusterScope.Info("LB DNS Record is already ready")
+			r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "DomainRecordReady", "DNS Record '%s.%s' with IP '%s'", recordSpec.Name, recordSpec.Domain, loadbalancerIP)
 		}
-
-		clusterScope.Info("LB DNS Record is already ready")
-		r.Recorder.Eventf(docluster, corev1.EventTypeNormal, "DomainRecordReady", "DNS Record '%s.%s' with IP '%s'", recordSpec.Name, recordSpec.Domain, controlPlaneEndpointIP)
 	}
 
 	clusterScope.SetControlPlaneEndpoint(clusterv1beta1.APIEndpoint{
