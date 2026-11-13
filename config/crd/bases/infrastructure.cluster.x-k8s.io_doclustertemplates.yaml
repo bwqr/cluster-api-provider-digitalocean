@@ -149,6 +149,9 @@ spec:
                                 description: The DO load balancer UUID. If omitted,
                                   a new load balancer will be created.
                                 type: string
+                              ip:
+                                description: The IP of custom load balancer. If omitted, ResourceID will take affect.
+                                type: string
                             type: object
                           vpc:
                             description: VPC defines the VPC configuration.

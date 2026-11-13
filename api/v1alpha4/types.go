@@ -129,6 +129,9 @@ type DOLoadBalancer struct {
 	// The DO load balancer UUID. If omitted, a new load balancer will be created.
 	// +optional
 	ResourceID string `json:"resourceId,omitempty"`
+	// The IP of custom load balancer. If omitted, ResourceID will take affect.
+	// +optional
+	IP string `json:"ip,omitempty"`
 }
 
 // DOVPC define the DigitalOcean VPC configuration.
