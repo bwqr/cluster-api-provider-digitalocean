@@ -178,7 +178,7 @@ func (r *DOClusterReconciler) reconcile(ctx context.Context, clusterScope *scope
 	if docluster.Spec.ControlPlaneDNS != nil {
 		controlPlaneEndpoint = fmt.Sprintf("%s.%s", docluster.Spec.ControlPlaneDNS.Name, docluster.Spec.ControlPlaneDNS.Domain)
 
-		if apiServerLoadbalancer.IP != "" {
+		if apiServerLoadbalancer.IP == "" {
 			clusterScope.Info("Verifying LB DNS Record")
 			// ensure DNS record is created and use it as control plane endpoint
 			recordSpec := docluster.Spec.ControlPlaneDNS
